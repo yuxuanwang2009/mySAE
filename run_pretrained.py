@@ -2,26 +2,19 @@
 import argparse
 import torch
 import config
-from train_utils import Construct_optimizer
 from data_utils import ttos, stot
 from model import GPTLanguageModel
 from pathlib import Path
 
 # Utility functions
-def Load_pretrained(checkpoint_path: str = "checkpoint.pt", training = False, device = config.device) -> GPTLanguageModel:
+def Load_pretrained(checkpoint_path: str = "checkpoint.pt", device = config.device) -> GPTLanguageModel:
     if checkpoint_path == "GPT2.pt":
         config.cfg.vocab_size = 50257
     model = GPTLanguageModel(cfg=config.cfg).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)    
+    ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt["model"])
-    if training == True:
-        optimizer = Construct_optimizer(model, config.lr, config.weight_decay, device)
-        optimizer.load_state_dict(ckpt["optimizer"])
-        model.train()
-        return model, optimizer
-    else:
-        model.eval()
-        return model
+    model.eval()
+    return model
 
 def generate_words(prompt: str, model: GPTLanguageModel, max_new_tokens: int = 3000, beta: float = 1.0):
     with torch.no_grad():
