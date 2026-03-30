@@ -83,7 +83,7 @@ def main():
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=1e-2, end_factor=1.0, total_iters=args.warmup_steps)
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps - args.warmup_steps)
+        optimizer, T_max=total_steps - args.warmup_steps, eta_min=args.lr * 0.3)
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[args.warmup_steps])
     print(f"SAE: {config.n_emb} -> {args.d_sae} ({args.d_sae // config.n_emb}x expansion)")

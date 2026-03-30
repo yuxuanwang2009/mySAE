@@ -46,26 +46,21 @@ def main():
     print(f"Steering feature {args.feature} with scale {args.scale}")
     print(f"Hook: layer {hook_layer}, site '{hook_site}'")
 
-    # Steering hook: encode -> modify feature -> decode -> substitute
+    # Steering hook: add the feature's decoder direction directly to the residual stream
+    # This avoids SAE reconstruction error — just nudges the activation
+    feature_dir = sae.W_dec[:, args.feature].detach()  # (d_model,)
+    print(f"Decoder direction norm: {feature_dir.norm().item():.4f}")
+
     def steering_hook(module, input, output):
-        # output: (B, T, d_model)
-        residual = output
-        shape = residual.shape
-        flat = residual.reshape(-1, sae_cfg.d_model)
-
-        # Normalize like training
-        norms = flat.norm(dim=-1, keepdim=True)
-        flat_normed = flat / (norms + 1e-8)
-
-        # Encode, steer, decode
-        h = sae.encode(flat_normed)
-        h[:, args.feature] = h[:, args.feature] + args.scale
-        reconstructed = sae.decode(h)
-
-        # Rescale back
-        reconstructed = reconstructed * norms
-
-        return reconstructed.reshape(shape)
+        # Only steer the last token position (the one being generated)
+        steered = output.clone()
+        residual_norm = steered[:, -1, :].norm().item()
+        steered[:, -1, :] = steered[:, -1, :] + args.scale * feature_dir
+        if not hasattr(steering_hook, '_printed'):
+            print(f"Residual stream norm at last token: {residual_norm:.2f}")
+            print(f"Steering magnitude: {args.scale:.2f} ({args.scale/residual_norm:.1%} of residual)")
+            steering_hook._printed = True
+        return steered
 
     # Attach steering hook
     block = model.blocks[hook_layer]
