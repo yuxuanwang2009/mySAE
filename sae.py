@@ -13,7 +13,9 @@ from dataclasses import dataclass
 class SAEConfig:
     d_model: int = 768          # must match GPT-2's n_emb
     d_sae: int = 768 * 8        # 6144 sparse features
-    l1_coeff: float = 5e-3      # sparsity penalty weight
+    l1_coeff: float = 5e-3      # sparsity penalty weight (unused with topk)
+    activation: str = "relu"    # "relu" or "topk"
+    k: int = 30                 # number of active features (only used with topk)
 
 
 class SparseAutoencoder(nn.Module):
@@ -38,9 +40,15 @@ class SparseAutoencoder(nn.Module):
 
     def encode(self, x):
         """x: (batch, d_model) -> h: (batch, d_sae)"""
-        # Center, project, activate
         x_centered = x - self.b_dec                            # (batch, d_model)
-        h = torch.relu(x_centered @ self.W_enc.T + self.b_enc)  # (batch, d_sae)
+        pre_act = x_centered @ self.W_enc.T + self.b_enc       # (batch, d_sae)
+
+        if self.cfg.activation == "topk":
+            topk_vals, topk_idx = pre_act.topk(self.cfg.k, dim=-1)
+            h = torch.zeros_like(pre_act)
+            h.scatter_(-1, topk_idx, torch.relu(topk_vals))
+        else:
+            h = torch.relu(pre_act)
         return h
 
     def decode(self, h):
@@ -59,6 +67,9 @@ class SparseAutoencoder(nn.Module):
         # Losses
         mse = (x - x_hat).pow(2).mean()
         l1 = h.abs().mean()
-        loss = mse + self.cfg.l1_coeff * l1
+        if self.cfg.activation == "topk":
+            loss = mse  # sparsity enforced structurally
+        else:
+            loss = mse + self.cfg.l1_coeff * l1
 
         return loss, mse, l1, h, x_hat

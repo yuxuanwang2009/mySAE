@@ -9,6 +9,8 @@ See sae_tutorial.md for a conceptual walkthrough.
 """
 
 import argparse
+import csv
+import os
 import time
 import torch
 from torch.utils.data import DataLoader
@@ -26,13 +28,17 @@ def main():
     parser.add_argument("--hook_site", default="residual", choices=["residual", "mlp", "attn"],
                         help="Where to hook: residual stream, MLP output, or attention output")
     parser.add_argument("--d_sae", type=int, default=768 * 8, help="SAE hidden dimension")
-    parser.add_argument("--l1_coeff", type=float, default=5e-3, help="L1 sparsity penalty")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--l1_coeff", type=float, default=1e-2, help="L1 sparsity penalty (unused with topk)")
+    parser.add_argument("--activation", default="relu", choices=["relu", "topk"], help="Activation type")
+    parser.add_argument("--k", type=int, default=30, help="Number of active features (only used with topk)")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate")
+    parser.add_argument("--warmup_steps", type=int, default=500, help="LR warmup steps")
     parser.add_argument("--gpt2_batch_size", type=int, default=8, help="Sequences per GPT-2 forward pass")
-    parser.add_argument("--total_tokens", type=int, default=10_000_000, help="Total tokens to train on")
+    parser.add_argument("--total_tokens", type=int, default=30_000_000, help="Total tokens to train on")
     parser.add_argument("--log_interval", type=int, default=100, help="Print stats every N SAE steps")
     parser.add_argument("--norm_interval", type=int, default=100, help="Normalize decoder every N steps")
     parser.add_argument("--save_path", default="sae_checkpoint.pt", help="Where to save the trained SAE")
+    parser.add_argument("--log_dir", default="logs", help="Directory for CSV training logs")
     args = parser.parse_args()
 
     device = config.device
@@ -69,11 +75,35 @@ def main():
     print(f"Hook attached: layer {args.hook_layer}, site '{args.hook_site}'")
 
     # ── 3. Create SAE ──────────────────────────────────────────────────
-    sae_cfg = SAEConfig(d_model=config.n_emb, d_sae=args.d_sae, l1_coeff=args.l1_coeff)
+    sae_cfg = SAEConfig(d_model=config.n_emb, d_sae=args.d_sae, l1_coeff=args.l1_coeff,
+                        activation=args.activation, k=args.k)
     sae = SparseAutoencoder(sae_cfg).to(device)
     optimizer = torch.optim.Adam(sae.parameters(), lr=args.lr)
+    total_steps = args.total_tokens // (args.gpt2_batch_size * config.T)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-2, end_factor=1.0, total_iters=args.warmup_steps)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps - args.warmup_steps)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[args.warmup_steps])
     print(f"SAE: {config.n_emb} -> {args.d_sae} ({args.d_sae // config.n_emb}x expansion)")
     print(f"SAE parameters: {sum(p.numel() for p in sae.parameters()) / 1e6:.1f}M")
+
+    # ── 3b. Set up CSV logging ─────────────────────────────────────────
+    os.makedirs(args.log_dir, exist_ok=True)
+    if args.activation == "topk":
+        log_name = f"sae_L{args.hook_layer}_{args.hook_site}_topk-{args.k}_lr-{args.lr}.csv"
+    else:
+        log_name = f"sae_L{args.hook_layer}_{args.hook_site}_l1-{args.l1_coeff}_lr-{args.lr}.csv"
+    log_path = os.path.join(args.log_dir, log_name)
+    log_file = open(log_path, "w", newline="")
+    # Write run config as comment
+    log_file.write(f"# checkpoint={args.checkpoint} layer={args.hook_layer} site={args.hook_site} "
+                   f"d_sae={args.d_sae} l1_coeff={args.l1_coeff} lr={args.lr} "
+                   f"batch_size={args.gpt2_batch_size} total_tokens={args.total_tokens}\n")
+    log_writer = csv.writer(log_file)
+    log_writer.writerow(["step", "tokens", "mse", "l1", "L0", "expl_var", "tok_per_sec"])
+    print(f"Logging to {log_path}")
 
     # ── 4. Data stream ─────────────────────────────────────────────────
     doc_stream = HFDocStream("train", rank=0, world_size=1, limit=None, data_files=_train_files_for_epoch)
@@ -89,8 +119,7 @@ def main():
     t0 = time.time()
 
     print(f"\nTraining for {args.total_tokens:,} tokens...")
-    print(f"{'step':>8} {'tokens':>12} {'mse':>10} {'l1':>10} {'L0':>8} {'expl_var':>10} {'tok/s':>10}")
-    print("-" * 76)
+
 
     sae.train()
     for x, _y in loader:
@@ -103,12 +132,22 @@ def main():
         # Grab activations: (B, T, d_model) -> (B*T, d_model)
         acts = activations["value"]
         acts = acts.reshape(-1, config.n_emb)  # each token position is independent
+        acts_raw = acts
+        acts = acts / (acts.norm(dim=-1, keepdim=True) + 1e-8)  # unit-norm inputs
+
+        # # Print activation norm on first batch to calibrate L1 vs MSE
+        if sae_step == 0:
+            # print(f"[diag] activation norm: mean={acts.norm(dim=-1).mean().item():.2f}, "
+            #       f"std={acts.norm(dim=-1).std().item():.2f}")
+            print(f"{'step':>8} {'tokens':>12} {'mse':>10} {'L1':>10} {'L0':>8} {'expl_var':>10} {'tok/s':>10}")
+            print("-" * 76)
 
         # SAE forward + backward
         loss, mse, l1, h, x_hat = sae(acts)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        scheduler.step()
 
         # Normalize decoder columns periodically
         if sae_step % args.norm_interval == 0:
@@ -134,10 +173,15 @@ def main():
 
             # Explained variance on last batch
             with torch.no_grad():
-                expl_var = 1 - (acts - x_hat).var() / acts.var()
+                x_hat_rescaled = x_hat * acts_raw.norm(dim=-1, keepdim=True)
+                expl_var = 1 - (acts_raw - x_hat_rescaled).var() / acts_raw.var()
 
             print(f"{sae_step:>8d} {tokens_seen:>12,} {avg_mse:>10.4f} {avg_l1:>10.4f} "
                   f"{avg_l0:>8.1f} {expl_var.item():>10.4f} {tok_per_sec:>10.0f}")
+
+            log_writer.writerow([sae_step, tokens_seen, f"{avg_mse:.6f}", f"{avg_l1:.6f}",
+                                 f"{avg_l0:.1f}", f"{expl_var.item():.4f}", f"{tok_per_sec:.0f}"])
+            log_file.flush()
 
             running_mse = 0.0
             running_l1 = 0.0
@@ -149,6 +193,7 @@ def main():
 
     # ── 6. Save ─────────────────────────────────────────────────────────
     handle.remove()  # clean up the hook
+    log_file.close()
 
     save_dict = {
         "state_dict": sae.state_dict(),

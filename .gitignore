@@ -5,3 +5,5 @@ __pycache__/
 venv/
 *.pt
 Dataset
+logs
+core.python3*

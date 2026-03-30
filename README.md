@@ -21,6 +21,15 @@ A from-scratch GPT-2 (124M) implementation with a Sparse Autoencoder (SAE) for m
 | `sae.py` | SAE model (~65 lines) with config |
 | `train_sae.py` | Training script — hooks into frozen GPT-2, trains SAE on activations |
 | `eval_sae.py` | Analysis — reconstruction stats, top activating tokens, feature density |
+| `interpret.py` | Automated interpretability — uses Claude to describe and validate features |
+| `steer.py` | Feature steering — amplify/suppress SAE features during generation |
+
+## Setup
+
+```bash
+conda create -n mySAE python=3.11 -y && conda activate mySAE
+pip install torch datasets tiktoken anthropic
+```
 
 ## Quick Start
 
@@ -66,6 +75,30 @@ python eval_sae.py --sae sae_checkpoint.pt --mode top_tokens --feature 42
 # Feature firing frequency distribution
 python eval_sae.py --sae sae_checkpoint.pt --mode density
 ```
+
+### Interpret features with Claude
+
+```bash
+# Ask Claude to describe what a feature detects, then validate on held-out examples
+python interpret.py --sae sae_checkpoint.pt --feature 42
+
+# More data for better accuracy
+python interpret.py --sae sae_checkpoint.pt --feature 42 --n_batches 100
+```
+
+Requires `ANTHROPIC_API_KEY` set in your environment.
+
+### Steer generation with SAE features
+
+```bash
+# Amplify a feature during generation
+python steer.py --sae sae_checkpoint.pt --feature 42 --scale 5.0 --prompt "The scientist discovered"
+
+# Suppress a feature
+python steer.py --sae sae_checkpoint.pt --feature 42 --scale -5.0 --prompt "The scientist discovered"
+```
+
+Generates text with and without steering for comparison.
 
 ## How It Works
 
