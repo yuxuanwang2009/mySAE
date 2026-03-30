@@ -54,12 +54,7 @@ def main():
     def steering_hook(module, input, output):
         # Only steer the last token position (the one being generated)
         steered = output.clone()
-        residual_norm = steered[:, -1, :].norm().item()
         steered[:, -1, :] = steered[:, -1, :] + args.scale * feature_dir
-        if not hasattr(steering_hook, '_printed'):
-            print(f"Residual stream norm at last token: {residual_norm:.2f}")
-            print(f"Steering magnitude: {args.scale:.2f} ({args.scale/residual_norm:.1%} of residual)")
-            steering_hook._printed = True
         return steered
 
     # Attach steering hook
